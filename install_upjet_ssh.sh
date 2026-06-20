@@ -27,6 +27,8 @@ SUPPLIED_PANEL_PORT="${PANEL_PORT+x}"
 SUPPLIED_PANEL_SECRET="${PANEL_SECRET+x}"
 SUPPLIED_DEFAULT_DAYS="${DEFAULT_DAYS+x}"
 SUPPLIED_DEFAULT_QUOTA_GB="${DEFAULT_QUOTA_GB+x}"
+SUPPLIED_SSH_PUBLIC_HOST="${SSH_PUBLIC_HOST+x}"
+SUPPLIED_SSH_PORT="${SSH_PORT+x}"
 
 PANEL_ADMIN_USER="${PANEL_ADMIN_USER:-admin}"
 PANEL_PASSWORD="${PANEL_PASSWORD:-}"
@@ -35,9 +37,11 @@ PANEL_PORT="${PANEL_PORT:-9080}"
 PANEL_SECRET="${PANEL_SECRET:-}"
 DEFAULT_DAYS="${DEFAULT_DAYS:-30}"
 DEFAULT_QUOTA_GB="${DEFAULT_QUOTA_GB:-100}"
+SSH_PUBLIC_HOST="${SSH_PUBLIC_HOST:-}"
+SSH_PORT="${SSH_PORT:-22}"
 
 apt update
-apt install -y python3-flask iptables openssl bc passwd procps curl openssh-server adduser
+apt install -y python3-flask python3-qrcode python3-pil iptables openssl bc passwd procps curl openssh-server adduser
 
 mkdir -p /opt/upjet-ssh-panel /var/lib/upjet-ssh-panel
 chmod 700 /var/lib/upjet-ssh-panel
@@ -111,9 +115,11 @@ import re
 import secrets
 import subprocess
 import datetime
+import io
+from urllib.parse import quote
 from pathlib import Path
 from functools import wraps
-from flask import Flask, request, redirect, url_for, session, flash, render_template_string, abort
+from flask import Flask, request, redirect, url_for, session, flash, render_template_string, abort, Response
 
 BASE_DIR = Path('/var/lib/upjet-ssh-panel')
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -130,6 +136,16 @@ PANEL_HOST = os.environ.get('PANEL_HOST', '127.0.0.1')
 PANEL_PORT = int(os.environ.get('PANEL_PORT', '9080'))
 DEFAULT_DAYS = int(os.environ.get('DEFAULT_DAYS', '30'))
 DEFAULT_QUOTA_GB = int(os.environ.get('DEFAULT_QUOTA_GB', '100'))
+SSH_PUBLIC_HOST = os.environ.get('SSH_PUBLIC_HOST', '').strip()
+SSH_PORT = int(os.environ.get('SSH_PORT', '22'))
+
+# UPJET_QR_FEATURE
+
+try:
+    import qrcode
+    import qrcode.image.svg
+except Exception:
+    qrcode = None
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('PANEL_SECRET', secrets.token_hex(32))
@@ -270,6 +286,26 @@ def set_user_password(username, password):
     write_text(BASE_DIR / f'{username}.password', password)
 
 
+def get_connection_host():
+    configured = (SSH_PUBLIC_HOST or '').strip()
+    if configured:
+        return configured.split('/')[0].split(':')[0]
+    forwarded = request.headers.get('X-Forwarded-Host', '').strip()
+    host = forwarded or request.host or ''
+    return host.split(':')[0]
+
+
+def build_ssh_command(username):
+    return f'ssh -p {SSH_PORT} {username}@{get_connection_host()}'
+
+
+def build_ssh_uri(username):
+    password = read_text(BASE_DIR / f'{username}.password', '')
+    if not password:
+        return ''
+    return f'ssh://{quote(username, safe="")}:{quote(password, safe="")}@{get_connection_host()}:{SSH_PORT}'
+
+
 def list_panel_users():
     ensure_quota_chain()
     users = []
@@ -291,6 +327,8 @@ def list_panel_users():
             'exists': user_exists(username),
             'online': is_online(username),
             'password': get_saved_password(username),
+            'ssh_command': build_ssh_command(username),
+            'ssh_link': build_ssh_uri(username),
         })
     return users
 
@@ -312,10 +350,23 @@ input,select{width:100%;border:1px solid var(--line);background:#091629;color:va
 .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:18px}.stat{padding:18px}.stat .num{font-size:30px;font-weight:900}.stat .label{color:var(--muted);margin-top:4px}.card{padding:20px;margin-bottom:18px}.card h2,.card h3{margin:0 0 14px}.create-grid{display:grid;grid-template-columns:1.4fr .7fr .7fr 1fr;gap:12px}.small{font-size:12px;color:var(--muted);line-height:1.9}.hint{margin-top:10px}.users{display:grid;grid-template-columns:1fr;gap:14px}.user-card{padding:18px;border-radius:22px;background:rgba(7,17,31,.58);border:1px solid var(--line)}.user-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:14px}.username{font-size:23px;font-weight:900;direction:ltr;text-align:left}.badges{display:flex;gap:8px;flex-wrap:wrap}.badge{display:inline-flex;align-items:center;gap:6px;padding:7px 11px;border-radius:999px;font-size:12px;font-weight:900}.active{background:rgba(0,184,148,.18);color:#8ff5de}.locked{background:rgba(255,77,94,.16);color:#ff9aa4}.online{background:rgba(47,140,255,.18);color:#a8d0ff}.offline{background:rgba(255,255,255,.08);color:#b8c7db}.deleted{background:rgba(255,77,94,.16);color:#ff9aa4}.meta{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:14px}.m{padding:12px;border:1px solid var(--line);border-radius:16px;background:rgba(255,255,255,.035)}.m .k{color:var(--muted);font-size:12px;margin-bottom:6px}.m .v{font-weight:900;word-break:break-word}.password-box{direction:ltr;text-align:left;font-family:Consolas,monospace;background:#07101e;border:1px dashed #385577;border-radius:14px;padding:10px;min-height:42px;display:flex;align-items:center;overflow:auto}.progress{height:12px;background:#081222;border:1px solid var(--line);border-radius:999px;overflow:hidden;margin-top:8px}.bar{height:100%;background:linear-gradient(90deg,var(--blue),var(--cyan));border-radius:999px}.edit-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:12px}.actions{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-top:12px}.actions form,.edit-grid form{display:contents}.field label{display:block;color:var(--muted);font-size:12px;margin-bottom:6px}.login-page{display:grid;place-items:center;min-height:100vh;padding:20px}.login-box{width:100%;max-width:430px;padding:30px}.login-box .logo{margin:0 auto 14px;width:70px;height:70px}.login-box h1{text-align:center;margin:0;font-size:38px;letter-spacing:3px}.login-box p{text-align:center;color:var(--muted);margin:8px 0 22px}.login-box input,.login-box button{margin-top:10px}.login-box button{width:100%}.footer-note{color:var(--muted);font-size:12px;margin-top:14px;line-height:1.9}
 @media(max-width:1000px){.meta{grid-template-columns:repeat(2,1fr)}.edit-grid{grid-template-columns:repeat(2,1fr)}.actions{grid-template-columns:repeat(2,1fr)}.create-grid{grid-template-columns:1fr 1fr}.wrap{padding:14px}.top{display:block}.brand h1{font-size:28px}}
 @media(max-width:560px){.stats,.meta,.edit-grid,.actions,.create-grid{grid-template-columns:1fr}.user-head{display:block}.btn{width:100%}}
+.share-grid{display:grid;grid-template-columns:1.4fr 1.4fr 140px;gap:10px;margin-top:12px;align-items:stretch}.link-box{direction:ltr;text-align:left;font-family:Consolas,monospace;background:#07101e;border:1px solid var(--line);border-radius:14px;padding:10px;min-height:42px;overflow:auto;white-space:nowrap}.qr-box{display:grid;place-items:center;background:#fff;border-radius:16px;padding:8px;min-height:132px}.qr-box img{width:118px;height:118px}.copy-row{display:grid;grid-template-columns:1fr auto;gap:8px}.copy-row .btn{min-width:84px}.share-title{color:var(--muted);font-size:12px;margin-bottom:6px}@media(max-width:900px){.share-grid{grid-template-columns:1fr}.copy-row{grid-template-columns:1fr}.qr-box img{width:160px;height:160px}}
 </style>
 </head>
 <body>
 {{ body|safe }}
+
+<script>
+function upjetCopy(id){
+  var el=document.getElementById(id);
+  if(!el){return false;}
+  var text=(el.innerText||el.value||'').trim();
+  if(!text){return false;}
+  if(navigator.clipboard && window.isSecureContext){navigator.clipboard.writeText(text);}
+  else{var t=document.createElement('textarea');t.value=text;document.body.appendChild(t);t.select();document.execCommand('copy');document.body.removeChild(t);}
+  return false;
+}
+</script>
 </body></html>
 """
 
@@ -404,6 +455,31 @@ INDEX_BODY = """
           <div class="m"><div class="k">پسورد ذخیره‌شده</div><div class="password-box">{{u.password}}</div><div class="small">پسوردهای قبل از نصب این نسخه قابل بازیابی نیستند.</div></div>
         </div>
 
+        {% if u.ssh_link %}
+        <div class="share-grid">
+          <div>
+            <div class="share-title">دستور اتصال SSH</div>
+            <div class="copy-row">
+              <div class="link-box" id="cmd-{{ loop.index }}">{{ u.ssh_command }}</div>
+              <button class="btn secondary" type="button" onclick="return upjetCopy('cmd-{{ loop.index }}')">کپی</button>
+            </div>
+          </div>
+          <div>
+            <div class="share-title">لینک اتصال SSH</div>
+            <div class="copy-row">
+              <div class="link-box" id="link-{{ loop.index }}">{{ u.ssh_link }}</div>
+              <button class="btn secondary" type="button" onclick="return upjetCopy('link-{{ loop.index }}')">کپی</button>
+            </div>
+          </div>
+          <div>
+            <div class="share-title">QR Code</div>
+            <div class="qr-box"><img src="{{ url_for('qr_svg', username=u.username) }}" alt="QR {{u.username}}"></div>
+          </div>
+        </div>
+        {% else %}
+        <div class="msg err">برای ساخت لینک و QR، باید پسورد این کاربر داخل پنل ذخیره شده باشد. برای کاربران قدیمی، یک پسورد جدید تنظیم کن.</div>
+        {% endif %}
+
         {% if u.exists %}
         <form method="post" action="{{ url_for('edit_user', username=u.username) }}">
           <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
@@ -481,6 +557,23 @@ def index():
         default_quota_gb=DEFAULT_QUOTA_GB,
     )
 
+
+
+
+@app.route('/qr/<username>.svg')
+@login_required
+def qr_svg(username):
+    if not (valid_username(username) and user_exists(username)):
+        abort(404)
+    link = build_ssh_uri(username)
+    if not link:
+        abort(404)
+    if qrcode is None:
+        abort(500)
+    img = qrcode.make(link, image_factory=qrcode.image.svg.SvgPathImage)
+    buf = io.BytesIO()
+    img.save(buf)
+    return Response(buf.getvalue(), mimetype='image/svg+xml')
 
 @app.route('/create', methods=['POST'])
 @login_required
@@ -730,6 +823,8 @@ if [ -f /etc/upjet-ssh-panel.env ]; then
     CURRENT_PORT=$(grep '^PANEL_PORT=' /etc/upjet-ssh-panel.env | cut -d= -f2- || true)
     CURRENT_DAYS=$(grep '^DEFAULT_DAYS=' /etc/upjet-ssh-panel.env | cut -d= -f2- || true)
     CURRENT_QUOTA=$(grep '^DEFAULT_QUOTA_GB=' /etc/upjet-ssh-panel.env | cut -d= -f2- || true)
+    CURRENT_SSH_PUBLIC_HOST=$(grep '^SSH_PUBLIC_HOST=' /etc/upjet-ssh-panel.env | cut -d= -f2- || true)
+    CURRENT_SSH_PORT=$(grep '^SSH_PORT=' /etc/upjet-ssh-panel.env | cut -d= -f2- || true)
 
     if [ -z "$SUPPLIED_PANEL_ADMIN_USER" ] && [ -n "$CURRENT_ADMIN" ]; then PANEL_ADMIN_USER="$CURRENT_ADMIN"; fi
     if [ -z "$SUPPLIED_PANEL_PASSWORD" ] && [ -n "$CURRENT_PASS" ]; then PANEL_PASSWORD="$CURRENT_PASS"; fi
@@ -738,6 +833,8 @@ if [ -f /etc/upjet-ssh-panel.env ]; then
     if [ -z "$SUPPLIED_PANEL_PORT" ] && [ -n "$CURRENT_PORT" ]; then PANEL_PORT="$CURRENT_PORT"; fi
     if [ -z "$SUPPLIED_DEFAULT_DAYS" ] && [ -n "$CURRENT_DAYS" ]; then DEFAULT_DAYS="$CURRENT_DAYS"; fi
     if [ -z "$SUPPLIED_DEFAULT_QUOTA_GB" ] && [ -n "$CURRENT_QUOTA" ]; then DEFAULT_QUOTA_GB="$CURRENT_QUOTA"; fi
+    if [ -z "$SUPPLIED_SSH_PUBLIC_HOST" ] && [ -n "$CURRENT_SSH_PUBLIC_HOST" ]; then SSH_PUBLIC_HOST="$CURRENT_SSH_PUBLIC_HOST"; fi
+    if [ -z "$SUPPLIED_SSH_PORT" ] && [ -n "$CURRENT_SSH_PORT" ]; then SSH_PORT="$CURRENT_SSH_PORT"; fi
 fi
 
 cat > /etc/upjet-ssh-panel.env <<EOFENV
@@ -748,6 +845,8 @@ PANEL_HOST=$PANEL_HOST
 PANEL_PORT=$PANEL_PORT
 DEFAULT_DAYS=$DEFAULT_DAYS
 DEFAULT_QUOTA_GB=$DEFAULT_QUOTA_GB
+SSH_PUBLIC_HOST=$SSH_PUBLIC_HOST
+SSH_PORT=$SSH_PORT
 EOFENV
 chmod 600 /etc/upjet-ssh-panel.env
 
@@ -759,6 +858,8 @@ Host: $PANEL_HOST
 Port: $PANEL_PORT
 Default days: $DEFAULT_DAYS
 Default quota GB: $DEFAULT_QUOTA_GB
+SSH public host: $SSH_PUBLIC_HOST
+SSH port: $SSH_PORT
 EOFLOGIN
 chmod 600 /root/upjet-panel-login.txt
 
@@ -823,6 +924,7 @@ echo 'UPJET SSH Panel fixed full version installed.'
 echo "Username: $PANEL_ADMIN_USER"
 echo "Password: $PANEL_PASSWORD"
 echo "Panel listens on: $PANEL_HOST:$PANEL_PORT"
+echo "Generated SSH links use host: ${SSH_PUBLIC_HOST:-auto-from-panel-domain}, port: $SSH_PORT"
 echo 'Login file: /root/upjet-panel-login.txt'
 echo "Direct URL: http://${SERVER_IP}:${PANEL_PORT}"
 echo 'Safer SSH tunnel access:'
