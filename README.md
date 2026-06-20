@@ -55,6 +55,26 @@ The installer:
 - Adds `@sshclients hard maxlogins 1`
 - Stops the old `ssh-panel` service if it exists
 
+## Quick Install From GitHub
+
+Run this command as `root`:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/ahmadmute/Upjet_panel/main/install_upjet_ssh.sh)
+```
+
+If you are not logged in as `root`, use this safer sudo version:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ahmadmute/Upjet_panel/main/install_upjet_ssh.sh | sudo bash
+```
+
+Install with custom panel credentials:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ahmadmute/Upjet_panel/main/install_upjet_ssh.sh | sudo env PANEL_ADMIN_USER=admin PANEL_PASSWORD=StrongPassword123 PANEL_PORT=9080 PANEL_HOST=0.0.0.0 bash
+```
+
 ## Installation
 
 Clone the repository or upload the installer to your server.
