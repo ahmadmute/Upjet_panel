@@ -131,6 +131,7 @@ MIGRATION_TOOL = Path('/opt/upjet-ssh-panel/upjet_migration_tool.sh')
 # UPJET_PANEL_BACKUP_UI
 # UPJET_DOMAIN_SETTINGS_UI
 # UPJET_COLLAPSIBLE_USERS_UI
+# UPJET_PER_USER_COLLAPSE_ONLY
 
 USERNAME_RE = re.compile(r'^[a-z_][a-z0-9_-]{2,30}$')
 PROTECTED_USERS = {
@@ -1229,17 +1230,6 @@ function upjetToggleUser(id, btn){
   btn.setAttribute('aria-expanded', open ? 'true' : 'false');
   return false;
 }
-function upjetSetAllUsers(open){
-  document.querySelectorAll('.user-card').forEach(function(card){
-    var details=card.querySelector('.user-details');
-    var btn=card.querySelector('.collapse-btn');
-    if(!details || !btn){return;}
-    card.classList.toggle('open', !!open);
-    btn.innerText=open?'جمع کردن':'جزئیات';
-    btn.setAttribute('aria-expanded', open ? 'true' : 'false');
-  });
-  return false;
-}
 </script>
 </body></html>
 """
@@ -1375,10 +1365,7 @@ INDEX_BODY = """
   <div class="card glass">
     <div class="list-toolbar">
       <h3 style="margin:0">لیست کاربران</h3>
-      <div class="list-toolbar-actions">
-        <button class="btn secondary" type="button" onclick="return upjetSetAllUsers(true)">باز کردن همه</button>
-        <button class="btn secondary" type="button" onclick="return upjetSetAllUsers(false)">جمع کردن همه</button>
-      </div>
+      <div class="small">هر کاربر جداگانه با دکمه خودش باز و بسته می‌شود.</div>
     </div>
     <div class="users">
     {% for u in users %}
@@ -1398,11 +1385,11 @@ INDEX_BODY = """
               {% if u.online %}<span class="badge online">online</span>{% else %}<span class="badge offline">offline</span>{% endif %}
               {% if not u.exists %}<span class="badge deleted">deleted</span>{% endif %}
             </div>
-            <button class="btn secondary collapse-btn" type="button" aria-expanded="false" onclick="return upjetToggleUser('user-details-{{ loop.index }}', this)">جزئیات</button>
+            <button class="btn secondary collapse-btn" type="button" aria-expanded="false" onclick="return upjetToggleUser('user-details-{{ u.username }}-{{ loop.index }}', this)">جزئیات</button>
           </div>
         </div>
 
-        <div class="user-details" id="user-details-{{ loop.index }}">
+        <div class="user-details" id="user-details-{{ u.username }}-{{ loop.index }}">
         <div class="meta">
           <div class="m"><div class="k">مصرف</div><div class="v">{{u.used_gb}} GB</div></div>
           <div class="m"><div class="k">حجم</div><div class="v">{{u.quota_gb}} GB</div></div>
