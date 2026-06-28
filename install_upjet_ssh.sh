@@ -115,14 +115,23 @@ import re
 import secrets
 import subprocess
 import datetime
+import time
+import shlex
 import io
 from urllib.parse import quote
 from pathlib import Path
 from functools import wraps
-from flask import Flask, request, redirect, url_for, session, flash, render_template_string, abort, Response
+from flask import Flask, request, redirect, url_for, session, flash, render_template_string, abort, Response, send_file
 
 BASE_DIR = Path('/var/lib/upjet-ssh-panel')
 BASE_DIR.mkdir(parents=True, exist_ok=True)
+BACKUP_DIR = Path('/var/backups/upjet-ssh-panel')
+BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+MIGRATION_TOOL = Path('/opt/upjet-ssh-panel/upjet_migration_tool.sh')
+# UPJET_PANEL_BACKUP_UI
+# UPJET_DOMAIN_SETTINGS_UI
+# UPJET_COLLAPSIBLE_USERS_UI
+# UPJET_PER_USER_COLLAPSE_ONLY
 
 USERNAME_RE = re.compile(r'^[a-z_][a-z0-9_-]{2,30}$')
 PROTECTED_USERS = {
@@ -170,6 +179,110 @@ def write_text(path, value):
     p = Path(path)
     p.write_text(str(value), encoding='utf-8')
     os.chmod(p, 0o600)
+
+
+
+
+def human_size(num):
+    try:
+        num = float(num)
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if num < 1024:
+                return f'{num:.1f} {unit}'
+            num /= 1024
+        return f'{num:.1f} PB'
+    except Exception:
+        return '0 B'
+
+
+def safe_backup_path(filename):
+    name = os.path.basename(filename or '')
+    if not re.fullmatch(r'[A-Za-z0-9_.-]+\.tar\.gz', name):
+        abort(400)
+    path = BACKUP_DIR / name
+    if path.parent != BACKUP_DIR:
+        abort(400)
+    return path
+
+
+def list_backup_files():
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    items = []
+    for p in sorted(BACKUP_DIR.glob('*.tar.gz'), key=lambda x: x.stat().st_mtime, reverse=True):
+        try:
+            st = p.stat()
+            items.append({
+                'name': p.name,
+                'size': human_size(st.st_size),
+                'created': datetime.datetime.fromtimestamp(st.st_mtime).strftime('%Y-%m-%d %H:%M:%S'),
+            })
+        except Exception:
+            continue
+    return items
+
+
+
+
+def read_env_file():
+    env = {}
+    try:
+        for line in Path('/etc/upjet-ssh-panel.env').read_text(encoding='utf-8').splitlines():
+            line = line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            k, v = line.split('=', 1)
+            env[k.strip()] = v.strip()
+    except Exception:
+        pass
+    return env
+
+
+def update_env_values(values):
+    env_path = Path('/etc/upjet-ssh-panel.env')
+    old_lines = []
+    if env_path.exists():
+        old_lines = env_path.read_text(encoding='utf-8').splitlines()
+
+    seen = set()
+    new_lines = []
+    for line in old_lines:
+        if '=' in line and not line.strip().startswith('#'):
+            key = line.split('=', 1)[0].strip()
+            if key in values:
+                new_lines.append(f'{key}={values[key]}')
+                seen.add(key)
+            else:
+                new_lines.append(line)
+        else:
+            new_lines.append(line)
+
+    for key, value in values.items():
+        if key not in seen:
+            new_lines.append(f'{key}={value}')
+
+    env_path.write_text('\n'.join(new_lines).rstrip() + '\n', encoding='utf-8')
+    os.chmod(env_path, 0o600)
+
+
+def clean_public_host(value):
+    value = (value or '').strip()
+    value = re.sub(r'^https?://', '', value)
+    value = value.split('/')[0]
+    value = value.split(':')[0]
+    return value.strip()
+
+
+def get_saved_public_host():
+    env = read_env_file()
+    return clean_public_host(env.get('SSH_PUBLIC_HOST') or SSH_PUBLIC_HOST or '')
+
+
+def get_saved_ssh_port():
+    env = read_env_file()
+    try:
+        return int(env.get('SSH_PORT') or SSH_PORT or 22)
+    except Exception:
+        return 22
 
 
 def valid_username(username):
@@ -287,23 +400,23 @@ def set_user_password(username, password):
 
 
 def get_connection_host():
-    configured = (SSH_PUBLIC_HOST or '').strip()
+    configured = get_saved_public_host()
     if configured:
-        return configured.split('/')[0].split(':')[0]
+        return configured
     forwarded = request.headers.get('X-Forwarded-Host', '').strip()
     host = forwarded or request.host or ''
     return host.split(':')[0]
 
 
 def build_ssh_command(username):
-    return f'ssh -p {SSH_PORT} {username}@{get_connection_host()}'
+    return f'ssh -p {get_saved_ssh_port()} {username}@{get_connection_host()}'
 
 
 def build_ssh_uri(username):
     password = read_text(BASE_DIR / f'{username}.password', '')
     if not password:
         return ''
-    return f'ssh://{quote(username, safe="")}:{quote(password, safe="")}@{get_connection_host()}:{SSH_PORT}'
+    return f'ssh://{quote(username, safe="")}:{quote(password, safe="")}@{get_connection_host()}:{get_saved_ssh_port()}'
 
 
 def list_panel_users():
@@ -956,6 +1069,143 @@ input:focus,select:focus{
   .btn{width:100%}
   .card,.user-card{padding:16px}
 }
+
+.backup-grid{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:12px;
+  align-items:start;
+}
+.backup-panel{
+  padding:14px;
+  border:1px solid var(--line);
+  border-radius:18px;
+  background:rgba(255,255,255,.035);
+}
+.backup-panel h4{
+  margin:0 0 10px;
+  font-size:14px;
+  font-weight:900;
+}
+.backup-list{
+  display:grid;
+  gap:10px;
+  margin-top:14px;
+}
+.backup-item{
+  display:grid;
+  grid-template-columns:1fr auto;
+  gap:12px;
+  align-items:center;
+  border:1px solid var(--line);
+  border-radius:18px;
+  padding:12px;
+  background:rgba(5,11,22,.45);
+}
+.backup-name{
+  direction:ltr;
+  text-align:left;
+  font-family:Consolas,'SFMono-Regular','Roboto Mono',monospace;
+  font-size:13px;
+  overflow:auto;
+  white-space:nowrap;
+}
+.backup-actions{
+  display:flex;
+  gap:8px;
+  flex-wrap:wrap;
+  justify-content:flex-end;
+}
+.backup-danger-note{
+  color:#fca5a5;
+  font-size:12px;
+  line-height:1.9;
+  margin-top:10px;
+}
+@media(max-width:900px){
+  .backup-grid,.backup-item{grid-template-columns:1fr}
+  .backup-actions{justify-content:stretch}
+}
+
+
+.domain-preview{
+  direction:ltr;
+  text-align:left;
+  font-family:Consolas,'SFMono-Regular','Roboto Mono',monospace;
+  background:#050b16;
+  border:1px solid rgba(34,211,238,.28);
+  border-radius:15px;
+  padding:12px;
+  margin-top:12px;
+  color:#dbeafe;
+  overflow:auto;
+  white-space:nowrap;
+}
+
+
+.user-summary{
+  margin-top:8px;
+  display:flex;
+  gap:8px;
+  flex-wrap:wrap;
+  align-items:center;
+  color:var(--muted);
+  font-size:12px;
+  font-weight:750;
+}
+.summary-pill{
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  border:1px solid var(--line);
+  background:rgba(255,255,255,.035);
+  border-radius:999px;
+  padding:6px 10px;
+}
+.user-tools{
+  display:flex;
+  gap:8px;
+  align-items:center;
+  justify-content:flex-end;
+  flex-wrap:wrap;
+}
+.collapse-btn{
+  min-width:106px;
+}
+.user-details{
+  display:none;
+  animation:upjetDrop .18s ease both;
+}
+.user-card.open .user-details{
+  display:block;
+}
+.user-card.open .collapse-btn{
+  border-color:rgba(34,211,238,.55);
+  background:rgba(34,211,238,.11);
+}
+.list-toolbar{
+  display:flex;
+  justify-content:space-between;
+  gap:12px;
+  align-items:center;
+  margin-bottom:14px;
+}
+.list-toolbar-actions{
+  display:flex;
+  gap:8px;
+  flex-wrap:wrap;
+  justify-content:flex-end;
+}
+@keyframes upjetDrop{
+  from{opacity:0;transform:translateY(-6px)}
+  to{opacity:1;transform:translateY(0)}
+}
+@media(max-width:680px){
+  .user-tools,.list-toolbar{display:block}
+  .list-toolbar-actions{justify-content:stretch;margin-top:10px}
+  .collapse-btn{width:100%}
+}
+
 </style>
 </head>
 <body>
@@ -969,6 +1219,15 @@ function upjetCopy(id){
   if(!text){return false;}
   if(navigator.clipboard && window.isSecureContext){navigator.clipboard.writeText(text);}
   else{var t=document.createElement('textarea');t.value=text;document.body.appendChild(t);t.select();document.execCommand('copy');document.body.removeChild(t);}
+  return false;
+}
+function upjetToggleUser(id, btn){
+  var el=document.getElementById(id);
+  if(!el){return false;}
+  var card=el.closest('.user-card');
+  var open=card.classList.toggle('open');
+  btn.innerText=open?'جمع کردن':'جزئیات';
+  btn.setAttribute('aria-expanded', open ? 'true' : 'false');
   return false;
 }
 </script>
@@ -1021,6 +1280,74 @@ INDEX_BODY = """
     <div class="stat glass"><div class="num">{{ stats.locked }}</div><div class="label">قفل شده</div></div>
   </div>
 
+
+  <div class="card glass">
+    <h3>بکاپ و ریستور برای انتقال سرور</h3>
+
+    <div class="backup-grid">
+      <div class="backup-panel">
+        <h4>گرفتن بکاپ کامل</h4>
+        <form method="post" action="{{ url_for('create_backup') }}">
+          <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+          <button class="btn ok" type="submit">ساخت و دانلود بکاپ</button>
+        </form>
+        <div class="small hint">شامل کاربران SSH، هش پسوردها، تاریخ انقضا، حجم، وضعیت، پسوردهای ذخیره‌شده پنل و فایل‌های پنل.</div>
+      </div>
+
+      <div class="backup-panel">
+        <h4>ریستور بکاپ</h4>
+        <form method="post" action="{{ url_for('restore_backup') }}" enctype="multipart/form-data" onsubmit="return confirm('ریستور بکاپ می‌تواند کاربران و تنظیمات فعلی را تغییر دهد. ادامه می‌دهی؟')">
+          <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+          <input type="file" name="backup_file" accept=".gz,.tar.gz" required>
+          <button class="btn warn" type="submit" style="margin-top:10px">آپلود و ریستور</button>
+        </form>
+        <div class="backup-danger-note">هشدار: فایل بکاپ شامل اطلاعات حساس و هش پسوردهاست. آن را عمومی نکن.</div>
+      </div>
+    </div>
+
+    {% if backups %}
+    <div class="backup-list">
+      {% for b in backups %}
+      <div class="backup-item">
+        <div>
+          <div class="backup-name">{{ b.name }}</div>
+          <div class="small">حجم: {{ b.size }} · تاریخ: {{ b.created }}</div>
+        </div>
+        <div class="backup-actions">
+          <a class="btn secondary" href="{{ url_for('download_backup', filename=b.name) }}">دانلود</a>
+          <form method="post" action="{{ url_for('restore_existing_backup', filename=b.name) }}" onsubmit="return confirm('این بکاپ ریستور شود؟')">
+            <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+            <button class="btn warn" type="submit">ریستور</button>
+          </form>
+          <form method="post" action="{{ url_for('delete_backup', filename=b.name) }}" onsubmit="return confirm('این بکاپ حذف شود؟')">
+            <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+            <button class="btn danger" type="submit">حذف</button>
+          </form>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}
+      <div class="small hint">هنوز بکاپی ساخته نشده است.</div>
+    {% endif %}
+  </div>
+
+
+  <div class="card glass">
+    <h3>تنظیم دامنه اتصال کاربران</h3>
+    <form method="post" action="{{ url_for('save_domain_settings') }}">
+      <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+      <div class="create-grid">
+        <input name="ssh_public_host" value="{{ ssh_public_host }}" placeholder="مثلاً: p.brandto.ir یا ssh.example.com">
+        <input name="ssh_port" type="number" min="1" max="65535" value="{{ ssh_port }}" placeholder="پورت SSH">
+        <button class="btn" type="submit">ذخیره دامنه</button>
+        <a class="btn secondary" href="{{ url_for('index') }}">رفرش</a>
+      </div>
+      <div class="small hint">این دامنه در لینک اتصال و QR Code جای IP قرار می‌گیرد. DNS دامنه باید روی IP همین سرور A Record شده باشد.</div>
+      <div class="domain-preview">ssh -p {{ ssh_port }} username@{{ ssh_public_host or request.host.split(':')[0] }}</div>
+    </form>
+  </div>
+
   <div class="card glass">
     <h3>ساخت کاربر جدید</h3>
     <form method="post" action="{{ url_for('create_user') }}">
@@ -1036,22 +1363,33 @@ INDEX_BODY = """
   </div>
 
   <div class="card glass">
-    <h3>لیست کاربران</h3>
+    <div class="list-toolbar">
+      <h3 style="margin:0">لیست کاربران</h3>
+      <div class="small">هر کاربر جداگانه با دکمه خودش باز و بسته می‌شود.</div>
+    </div>
     <div class="users">
     {% for u in users %}
       <div class="user-card">
         <div class="user-head">
           <div>
             <div class="username">{{u.username}}</div>
-            <div class="small">انقضا: {{u.expiry}}</div>
+            <div class="user-summary">
+              <span class="summary-pill">انقضا: {{u.expiry}}</span>
+              <span class="summary-pill">مصرف: {{u.used_gb}} / {{u.quota_gb}} GB</span>
+              <span class="summary-pill">{{u.percent}}%</span>
+            </div>
           </div>
-          <div class="badges">
-            <span class="badge {{u.status}}">{{u.status}}</span>
-            {% if u.online %}<span class="badge online">online</span>{% else %}<span class="badge offline">offline</span>{% endif %}
-            {% if not u.exists %}<span class="badge deleted">deleted</span>{% endif %}
+          <div class="user-tools">
+            <div class="badges">
+              <span class="badge {{u.status}}">{{u.status}}</span>
+              {% if u.online %}<span class="badge online">online</span>{% else %}<span class="badge offline">offline</span>{% endif %}
+              {% if not u.exists %}<span class="badge deleted">deleted</span>{% endif %}
+            </div>
+            <button class="btn secondary collapse-btn" type="button" aria-expanded="false" onclick="return upjetToggleUser('user-details-{{ u.username }}-{{ loop.index }}', this)">جزئیات</button>
           </div>
         </div>
 
+        <div class="user-details" id="user-details-{{ u.username }}-{{ loop.index }}">
         <div class="meta">
           <div class="m"><div class="k">مصرف</div><div class="v">{{u.used_gb}} GB</div></div>
           <div class="m"><div class="k">حجم</div><div class="v">{{u.quota_gb}} GB</div></div>
@@ -1105,6 +1443,7 @@ INDEX_BODY = """
           <form method="post" action="{{ url_for('delete_user', username=u.username) }}" onsubmit="return confirm('کاربر کامل حذف شود؟')"><input type="hidden" name="_csrf" value="{{ csrf_token() }}"><button class="btn danger" type="submit">حذف</button></form>
         </div>
         {% endif %}
+        </div>
       </div>
     {% else %}
       <div class="user-card">هنوز کاربری ساخته نشده است.</div>
@@ -1160,6 +1499,9 @@ def index():
         stats=stats,
         default_days=DEFAULT_DAYS,
         default_quota_gb=DEFAULT_QUOTA_GB,
+        backups=list_backup_files(),
+        ssh_public_host=get_saved_public_host(),
+        ssh_port=get_saved_ssh_port(),
     )
 
 
@@ -1179,6 +1521,136 @@ def qr_svg(username):
     buf = io.BytesIO()
     img.save(buf)
     return Response(buf.getvalue(), mimetype='image/svg+xml')
+
+
+
+@app.route('/backup/create', methods=['POST'])
+@login_required
+def create_backup():
+    check_csrf()
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    filename = f"upjet-migration-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}.tar.gz"
+    target = BACKUP_DIR / filename
+    try:
+        subprocess.run(
+            ['bash', str(MIGRATION_TOOL), 'backup', str(target)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=120,
+            check=True
+        )
+        if target.exists():
+            return send_file(target, as_attachment=True, download_name=target.name)
+        flash('بکاپ ساخته شد ولی فایل برای دانلود پیدا نشد.', 'error')
+    except subprocess.CalledProcessError as e:
+        flash(f'خطا در ساخت بکاپ: {e.stderr or e.stdout}', 'error')
+    except Exception as e:
+        flash(f'خطا در ساخت بکاپ: {e}', 'error')
+    return redirect(url_for('index'))
+
+
+@app.route('/backup/download/<path:filename>')
+@login_required
+def download_backup(filename):
+    path = safe_backup_path(filename)
+    if not path.exists():
+        abort(404)
+    return send_file(path, as_attachment=True, download_name=path.name)
+
+
+@app.route('/backup/delete/<path:filename>', methods=['POST'])
+@login_required
+def delete_backup(filename):
+    check_csrf()
+    path = safe_backup_path(filename)
+    if path.exists():
+        path.unlink()
+        flash(f'بکاپ حذف شد: {path.name}')
+    return redirect(url_for('index'))
+
+
+def start_restore_job(path):
+    log_path = Path('/var/log/upjet-restore.log')
+    log = open(log_path, 'ab')
+    subprocess.Popen(
+        ['bash', str(MIGRATION_TOOL), 'restore', str(path)],
+        stdout=log,
+        stderr=log,
+        start_new_session=True
+    )
+
+
+@app.route('/backup/restore/<path:filename>', methods=['POST'])
+@login_required
+def restore_existing_backup(filename):
+    check_csrf()
+    path = safe_backup_path(filename)
+    if not path.exists():
+        abort(404)
+    try:
+        start_restore_job(path)
+        flash('ریستور شروع شد. ۳۰ تا ۶۰ ثانیه صبر کن و صفحه را رفرش کن. لاگ: /var/log/upjet-restore.log')
+    except Exception as e:
+        flash(f'خطا در شروع ریستور: {e}', 'error')
+    return redirect(url_for('index'))
+
+
+@app.route('/backup/restore', methods=['POST'])
+@login_required
+def restore_backup():
+    check_csrf()
+    file = request.files.get('backup_file')
+    if not file or not file.filename:
+        flash('فایل بکاپ انتخاب نشده است.', 'error')
+        return redirect(url_for('index'))
+
+    original = os.path.basename(file.filename).replace(' ', '_')
+    if not original.endswith('.tar.gz'):
+        flash('فرمت بکاپ باید .tar.gz باشد.', 'error')
+        return redirect(url_for('index'))
+
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    filename = f"uploaded-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}-{original}"
+    target = BACKUP_DIR / filename
+    file.save(target)
+    os.chmod(target, 0o600)
+
+    try:
+        start_restore_job(target)
+        flash('فایل بکاپ آپلود شد و ریستور شروع شد. ۳۰ تا ۶۰ ثانیه صبر کن و صفحه را رفرش کن. لاگ: /var/log/upjet-restore.log')
+    except Exception as e:
+        flash(f'خطا در شروع ریستور: {e}', 'error')
+    return redirect(url_for('index'))
+
+
+
+@app.route('/settings/domain', methods=['POST'])
+@login_required
+def save_domain_settings():
+    check_csrf()
+    host = clean_public_host(request.form.get('ssh_public_host', ''))
+    port_raw = (request.form.get('ssh_port', '22') or '22').strip()
+
+    if host and not re.fullmatch(r'[A-Za-z0-9.-]{3,253}', host):
+        flash('دامنه معتبر نیست. فقط دامنه یا ساب‌دامین وارد کن، بدون http و بدون /', 'error')
+        return redirect(url_for('index'))
+
+    try:
+        port = int(port_raw)
+        if port < 1 or port > 65535:
+            raise ValueError()
+    except Exception:
+        flash('پورت SSH معتبر نیست.', 'error')
+        return redirect(url_for('index'))
+
+    update_env_values({
+        'SSH_PUBLIC_HOST': host,
+        'SSH_PORT': str(port),
+    })
+
+    flash('دامنه اتصال ذخیره شد. از این به بعد لینک‌ها و QR Code با دامنه ساخته می‌شوند.')
+    return redirect(url_for('index'))
 
 @app.route('/create', methods=['POST'])
 @login_required
@@ -1409,7 +1881,310 @@ for QUOTA_FILE in "$BASE_DIR"/*.quota; do
 done
 SH
 
-chmod +x /opt/upjet-ssh-panel/app.py /opt/upjet-ssh-panel/monitor_quota.sh
+cat > /opt/upjet-ssh-panel/upjet_migration_tool.sh <<'MIGRATION'
+#!/bin/bash
+set -euo pipefail
+
+DATA_DIR="/var/lib/upjet-ssh-panel"
+APP_DIR="/opt/upjet-ssh-panel"
+ENV_FILE="/etc/upjet-ssh-panel.env"
+SERVICE_FILE="/etc/systemd/system/upjet-ssh-panel.service"
+BACKUP_DIR="/var/backups/upjet-ssh-panel"
+GROUP_NAME="sshclients"
+
+usage() {
+cat <<'EOF'
+UPJET Migration Tool
+
+Usage:
+  sudo bash upjet_migration_tool.sh backup
+  sudo bash upjet_migration_tool.sh backup /root/upjet-backup.tar.gz
+  sudo bash upjet_migration_tool.sh restore /root/upjet-backup.tar.gz
+  sudo bash upjet_migration_tool.sh list
+
+This backup is usable on another server.
+It includes panel data, stored panel passwords, Linux managed users,
+their SSH password hashes, quotas, expiry dates, status files and app config.
+EOF
+}
+
+require_root() {
+    if [ "${EUID}" -ne 0 ]; then
+        echo "Run as root."
+        exit 1
+    fi
+}
+
+valid_username() {
+    [[ "$1" =~ ^[a-z_][a-z0-9_-]{2,30}$ ]]
+}
+
+managed_users() {
+    [ -d "$DATA_DIR" ] || return 0
+    for quota_file in "$DATA_DIR"/*.quota; do
+        [ -e "$quota_file" ] || continue
+        user="$(basename "$quota_file" .quota)"
+        valid_username "$user" || continue
+        echo "$user"
+    done | sort -u
+}
+
+ensure_ssh_login_rules() {
+    getent group "$GROUP_NAME" >/dev/null || groupadd "$GROUP_NAME"
+
+    if ! grep -q "^@${GROUP_NAME} hard maxlogins 1" /etc/security/limits.conf; then
+        echo "@${GROUP_NAME} hard maxlogins 1" >> /etc/security/limits.conf
+    fi
+
+    if grep -qE '^#?PasswordAuthentication' /etc/ssh/sshd_config; then
+        sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+    else
+        echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config
+    fi
+
+    if grep -qE '^#?KbdInteractiveAuthentication' /etc/ssh/sshd_config; then
+        sed -i 's/^#\?KbdInteractiveAuthentication.*/KbdInteractiveAuthentication yes/' /etc/ssh/sshd_config
+    else
+        echo 'KbdInteractiveAuthentication yes' >> /etc/ssh/sshd_config
+    fi
+
+    if grep -qE '^#?UsePAM' /etc/ssh/sshd_config; then
+        sed -i 's/^#\?UsePAM.*/UsePAM yes/' /etc/ssh/sshd_config
+    else
+        echo 'UsePAM yes' >> /etc/ssh/sshd_config
+    fi
+
+    if grep -qE '^#?PermitEmptyPasswords' /etc/ssh/sshd_config; then
+        sed -i 's/^#\?PermitEmptyPasswords.*/PermitEmptyPasswords no/' /etc/ssh/sshd_config
+    else
+        echo 'PermitEmptyPasswords no' >> /etc/ssh/sshd_config
+    fi
+
+    if grep -qE '^#?MaxSessions' /etc/ssh/sshd_config; then
+        sed -i 's/^#\?MaxSessions.*/MaxSessions 1/' /etc/ssh/sshd_config
+    else
+        echo 'MaxSessions 1' >> /etc/ssh/sshd_config
+    fi
+
+    sshd -t
+    systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+}
+
+backup_cmd() {
+    require_root
+
+    mkdir -p "$BACKUP_DIR"
+
+    out="${1:-}"
+    ts="$(date +%Y%m%d-%H%M%S)"
+
+    if [ -z "$out" ]; then
+        out="$BACKUP_DIR/upjet-migration-$ts.tar.gz"
+    fi
+
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' EXIT
+
+    mkdir -p "$tmp/rootfs" "$tmp/meta"
+
+    [ -d "$DATA_DIR" ] && mkdir -p "$tmp/rootfs/var/lib" && cp -a "$DATA_DIR" "$tmp/rootfs/var/lib/upjet-ssh-panel"
+    [ -d "$APP_DIR" ] && mkdir -p "$tmp/rootfs/opt" && cp -a "$APP_DIR" "$tmp/rootfs/opt/upjet-ssh-panel"
+    [ -f "$ENV_FILE" ] && mkdir -p "$tmp/rootfs/etc" && cp -a "$ENV_FILE" "$tmp/rootfs/etc/upjet-ssh-panel.env"
+    [ -f "$SERVICE_FILE" ] && mkdir -p "$tmp/rootfs/etc/systemd/system" && cp -a "$SERVICE_FILE" "$tmp/rootfs/etc/systemd/system/upjet-ssh-panel.service"
+
+    {
+        echo "UPJET_BACKUP_VERSION=4"
+        echo "CREATED_AT=$(date -Iseconds)"
+        echo "HOSTNAME=$(hostname)"
+        echo "SOURCE_IP=$(hostname -I | awk '{print $1}')"
+    } > "$tmp/meta/backup.info"
+
+    : > "$tmp/meta/users.tsv"
+
+    while IFS= read -r user; do
+        [ -n "$user" ] || continue
+        id "$user" >/dev/null 2>&1 || continue
+
+        uid="$(id -u "$user")"
+        gid="$(id -g "$user")"
+        home="$(getent passwd "$user" | cut -d: -f6)"
+        shell="$(getent passwd "$user" | cut -d: -f7)"
+        hash="$(getent shadow "$user" | cut -d: -f2)"
+        expire="$(getent shadow "$user" | cut -d: -f8)"
+        groups="$(id -nG "$user" | tr ' ' ',')"
+
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$user" "$uid" "$gid" "$home" "$shell" "$hash" "${expire:-}" "$groups" >> "$tmp/meta/users.tsv"
+
+        if [ -d "$home" ]; then
+            mkdir -p "$tmp/rootfs/home"
+            cp -a "$home" "$tmp/rootfs/home/" 2>/dev/null || true
+        fi
+    done < <(managed_users)
+
+    chmod -R go-rwx "$tmp"
+    tar -C "$tmp" -czf "$out" .
+    chmod 600 "$out"
+
+    echo "$out"
+}
+
+restore_cmd() {
+    require_root
+
+    archive="${1:-}"
+    if [ -z "$archive" ] || [ ! -f "$archive" ]; then
+        echo "Backup file not found."
+        usage
+        exit 1
+    fi
+
+    export DEBIAN_FRONTEND=noninteractive
+    apt update
+    apt install -y python3-flask python3-qrcode python3-pil iptables openssl bc passwd procps curl openssh-server adduser tar
+
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' EXIT
+
+    tar -C "$tmp" -xzf "$archive"
+
+    if [ ! -f "$tmp/meta/backup.info" ]; then
+        echo "Invalid backup."
+        exit 1
+    fi
+
+    echo "Restoring:"
+    cat "$tmp/meta/backup.info"
+    echo
+
+    ensure_ssh_login_rules
+
+    systemctl stop upjet-ssh-panel 2>/dev/null || true
+
+    if [ -d "$tmp/rootfs/var/lib/upjet-ssh-panel" ]; then
+        mkdir -p /var/lib
+        rm -rf "$DATA_DIR"
+        cp -a "$tmp/rootfs/var/lib/upjet-ssh-panel" "$DATA_DIR"
+        chmod 700 "$DATA_DIR"
+        chmod 600 "$DATA_DIR"/* 2>/dev/null || true
+    fi
+
+    if [ -d "$tmp/rootfs/opt/upjet-ssh-panel" ]; then
+        mkdir -p /opt
+        rm -rf "$APP_DIR"
+        cp -a "$tmp/rootfs/opt/upjet-ssh-panel" "$APP_DIR"
+        chmod +x "$APP_DIR"/*.py "$APP_DIR"/*.sh 2>/dev/null || true
+    fi
+
+    if [ -f "$tmp/rootfs/etc/upjet-ssh-panel.env" ]; then
+        cp -a "$tmp/rootfs/etc/upjet-ssh-panel.env" "$ENV_FILE"
+        chmod 600 "$ENV_FILE"
+    fi
+
+    if [ -f "$tmp/rootfs/etc/systemd/system/upjet-ssh-panel.service" ]; then
+        cp -a "$tmp/rootfs/etc/systemd/system/upjet-ssh-panel.service" "$SERVICE_FILE"
+    else
+        cat > "$SERVICE_FILE" <<'EOF'
+[Unit]
+Description=UPJET SSH User Panel
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/upjet-ssh-panel
+EnvironmentFile=/etc/upjet-ssh-panel.env
+ExecStart=/usr/bin/python3 /opt/upjet-ssh-panel/app.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    fi
+
+    if [ -f "$tmp/meta/users.tsv" ]; then
+        while IFS=$'\t' read -r user uid gid home shell hash expire groups; do
+            [ -n "$user" ] || continue
+            valid_username "$user" || continue
+
+            if ! getent group "$gid" >/dev/null 2>&1; then
+                groupadd -g "$gid" "$user" 2>/dev/null || groupadd "$user" 2>/dev/null || true
+            fi
+
+            if ! id "$user" >/dev/null 2>&1; then
+                if getent group "$gid" >/dev/null 2>&1; then
+                    useradd -m -d "$home" -s "${shell:-/bin/bash}" -u "$uid" -g "$gid" "$user" 2>/dev/null || \
+                    useradd -m -d "$home" -s "${shell:-/bin/bash}" "$user"
+                else
+                    useradd -m -d "$home" -s "${shell:-/bin/bash}" "$user"
+                fi
+            else
+                usermod -s "${shell:-/bin/bash}" "$user" 2>/dev/null || true
+            fi
+
+            if [ -n "${hash:-}" ] && [ "$hash" != "!" ] && [ "$hash" != "*" ]; then
+                usermod -p "$hash" "$user" 2>/dev/null || true
+            fi
+
+            if [ -n "${expire:-}" ] && [[ "$expire" =~ ^[0-9]+$ ]]; then
+                chage -E "$expire" "$user" 2>/dev/null || true
+            fi
+
+            usermod -aG "$GROUP_NAME" "$user" 2>/dev/null || true
+        done < "$tmp/meta/users.tsv"
+    fi
+
+    if [ -d "$tmp/rootfs/home" ]; then
+        cp -a "$tmp/rootfs/home/." /home/ 2>/dev/null || true
+    fi
+
+    systemctl daemon-reload
+    systemctl enable upjet-ssh-panel >/dev/null 2>&1 || true
+    systemctl restart upjet-ssh-panel
+
+    if [ -x "$APP_DIR/monitor_quota.sh" ]; then
+        "$APP_DIR/monitor_quota.sh" || true
+    fi
+
+    (
+        crontab -l 2>/dev/null | grep -v '/opt/upjet-ssh-panel/monitor_quota.sh' || true
+        echo '@reboot /opt/upjet-ssh-panel/monitor_quota.sh'
+        echo '*/5 * * * * /opt/upjet-ssh-panel/monitor_quota.sh'
+    ) | crontab -
+
+    echo "Restore completed."
+}
+
+list_cmd() {
+    require_root
+    mkdir -p "$BACKUP_DIR"
+    ls -1 "$BACKUP_DIR"/*.tar.gz 2>/dev/null || true
+}
+
+case "${1:-}" in
+    backup)
+        backup_cmd "${2:-}"
+        ;;
+    restore)
+        restore_cmd "${2:-}"
+        ;;
+    list)
+        list_cmd
+        ;;
+    help|-h|--help|"")
+        usage
+        ;;
+    *)
+        echo "Unknown command: ${1:-}"
+        usage
+        exit 1
+        ;;
+esac
+
+MIGRATION
+
+chmod +x /opt/upjet-ssh-panel/app.py /opt/upjet-ssh-panel/monitor_quota.sh /opt/upjet-ssh-panel/upjet_migration_tool.sh
 
 # Environment setup
 if [ -z "$PANEL_PASSWORD" ]; then
